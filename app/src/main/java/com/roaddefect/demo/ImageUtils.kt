@@ -42,6 +42,8 @@ fun ImageProxy.toBitmap(): Bitmap {
 fun letterboxToSquare(imageProxy: ImageProxy, targetSize: Int): Bitmap {
     val bitmap = imageProxy.toBitmap()
 
+    android.util.Log.d("LetterboxDebug", "Original frame: ${bitmap.width}x${bitmap.height}")
+
     val originalWidth = bitmap.width
     val originalHeight = bitmap.height
 

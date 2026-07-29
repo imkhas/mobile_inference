@@ -17,6 +17,7 @@ build/
 .gradle/
 local.properties
 captures/
+.kotlin/
 .externalNativeBuild/
 .cxx/
 
@@ -30,7 +31,7 @@ captures/
 # ===================================
 # VS Code
 # ===================================
-# .vscode/
+.vscode/
 
 # ===================================
 # Environment / secrets
@@ -47,7 +48,8 @@ captures/
 Thumbs.db
 
 # ===================================
-# Logs
+# Logs & dumps
 # ===================================
 *.log
+*.hprof
 test_logs/

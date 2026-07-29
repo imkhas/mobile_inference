@@ -2,38 +2,148 @@ package com.roaddefect.demo
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.util.Log
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
+import org.tensorflow.lite.gpu.GpuDelegate
+import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 
 /**
- * Wraps the TFLite model: loading, preprocessing, running inference, and
- * decoding raw output into usable Detection objects. Keeping this separate
- * from MainActivity means model-specific logic can be tested/debugged
- * independently of camera/UI concerns.
+ * Wraps the TFLite model: loading, delegate fallback (NNAPI -> GPU -> XNNPACK CPU),
+ * preprocessing, and running inference. Decode/NMS logic lives in
+ * DetectionProcessor instead, so it can be unit tested independently.
+ *
+ * Delegate chain:
+ *   Tier 1: NNAPI     — routes to NPU on supported devices (no NPU on Dimensity 6100+)
+ *   Tier 2: GPU       — fixed batch size mismatch via CompatibilityList + dummy test
+ *   Tier 3: XNNPACK   — optimised CPU, faster than plain CPU fallback
  */
-class ModelInterpreter(context: Context, modelFileName: String = "best_int8.tflite") {
+class ModelInterpreter(
+    context: Context,
+    modelFileName: String = AppConfig.MODEL_FILE_NAME
+) {
 
     private val tflite: Interpreter
-    val modelInputSize = 640
+    private var nnApiDelegate: NnApiDelegate? = null
+    private var gpuDelegate: GpuDelegate? = null
 
-    val classNames = arrayOf(
-        "Alligator Cracking",   // 0: ac
-        "Pothole",               // 1: potholes
-        "Raveling",              // 2: raveling
-        "Stagnant Water",        // 3: sw
-        "Transverse Cracking",   // 4: tc
-        "Longitudinal Cracking"  // 5: lc
-    )
+    val modelInputSize = AppConfig.MODEL_INPUT_SIZE
+    val classNames = AppConfig.CLASS_NAMES
+
+    // Circuit breaker: if inference fails this many times in a row, stop attempting
+    // it on every frame (avoids burning CPU/battery retrying a broken state forever).
+    // Resets to 0 the moment a single inference succeeds again.
+    private var consecutiveFailures = 0
+    private val maxConsecutiveFailures = 10
 
     init {
-        tflite = Interpreter(loadModelFile(context, modelFileName))
-        Log.d("TFLiteInit", "Model loaded successfully")
+        tflite = buildInterpreter(context, modelFileName)
+        AppLog.d("TFLiteInit", "Model loaded successfully")
+        AppLog.d("TFLiteInit", "Active delegate — NNAPI: ${nnApiDelegate != null}, GPU: ${gpuDelegate != null}")
         logModelShapes()
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Delegate fallback chain
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun buildInterpreter(context: Context, modelFileName: String): Interpreter {
+        val modelBuffer = loadModelFile(context, modelFileName)
+
+        // Tier 1: NNAPI
+        tryNnapi(modelBuffer)?.let {
+            AppLog.d("TFLiteInit", "Using NNAPI delegate")
+            return it
+        }
+
+        // Tier 2: GPU — uses CompatibilityList to fix batch size mismatch
+        tryGpu(modelBuffer)?.let {
+            AppLog.d("TFLiteInit", "Using GPU delegate")
+            return it
+        }
+
+        // Tier 3: XNNPACK CPU — meaningfully faster than plain CPU on Cortex-A55/A76
+        AppLog.d("TFLiteInit", "Using XNNPACK CPU fallback")
+        return Interpreter(modelBuffer, Interpreter.Options().apply {
+            setUseXNNPACK(true)
+            setNumThreads(4)
+        })
+    }
+
+    private fun tryNnapi(modelBuffer: ByteBuffer): Interpreter? {
+        return try {
+            val delegate = NnApiDelegate()
+            nnApiDelegate = delegate
+            val interpreter = Interpreter(
+                modelBuffer,
+                Interpreter.Options().addDelegate(delegate)
+            )
+            AppLog.d("TFLiteInit", "NNAPI delegate initialized successfully")
+            interpreter
+        } catch (e: Exception) {
+            AppLog.e("TFLiteInit", "NNAPI delegate failed: ${e.message}")
+            nnApiDelegate?.close()
+            nnApiDelegate = null
+            null
+        }
+    }
+
+    private fun tryGpu(modelBuffer: ByteBuffer): Interpreter? {
+        // CompatibilityList picks the correct GPU options for this device
+        // and avoids the "batch size mismatch, expected 1 but got 400" crash
+        // caused by the dynamic output tensor shape in YOLO TFLite models.
+        val compatList = CompatibilityList()
+        if (!compatList.isDelegateSupportedOnThisDevice) {
+            AppLog.d("TFLiteInit", "GPU delegate not supported on this device")
+            return null
+        }
+
+        return try {
+            val delegate = GpuDelegate(
+                compatList.bestOptionsForThisDevice.apply {
+                    isPrecisionLossAllowed = true   // allows FP16 on GPU — faster
+                    inferencePreference =
+                        GpuDelegate.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED
+                }
+            )
+            gpuDelegate = delegate
+
+            val interpreter = Interpreter(
+                modelBuffer,
+                Interpreter.Options().addDelegate(delegate)
+            )
+
+            // Run a dummy forward pass to catch the batch size mismatch
+            // before committing to this delegate mid-session.
+            // If this throws, we fall through to XNNPACK cleanly.
+            val inputShape = interpreter.getInputTensor(0).shape()
+            val dummyInput = ByteBuffer.allocateDirect(
+                inputShape[0] * inputShape[1] * inputShape[2] * inputShape[3] * 4
+            ).apply { order(ByteOrder.nativeOrder()) }
+
+            val outputShape = interpreter.getOutputTensor(0).shape()
+            val dummyOutput = Array(outputShape[0]) {
+                Array(outputShape[1]) { FloatArray(outputShape[2]) }
+            }
+
+            interpreter.run(dummyInput, dummyOutput)
+            AppLog.d("TFLiteInit", "GPU delegate test pass — batch size compatible")
+            interpreter
+
+        } catch (e: Exception) {
+            AppLog.e("TFLiteInit", "GPU delegate failed: ${e.message}")
+            gpuDelegate?.close()
+            gpuDelegate = null
+            null
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Model loading
+    // ─────────────────────────────────────────────────────────────────────────
 
     /**
      * Loads a .tflite file from app/src/main/assets/ into a memory-mapped ByteBuffer.
@@ -48,25 +158,26 @@ class ModelInterpreter(context: Context, modelFileName: String = "best_int8.tfli
         return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
     }
 
-    /**
-     * Logs the model's expected input/output tensor shapes — useful for confirming
-     * the model matches expectations (640x640 input, 6-class output) before relying on it.
-     */
     private fun logModelShapes() {
         val inputShape = tflite.getInputTensor(0).shape()
         val outputShape = tflite.getOutputTensor(0).shape()
-        Log.d("TFLiteInit", "Input shape: ${inputShape.joinToString()}")
-        Log.d("TFLiteInit", "Output shape: ${outputShape.joinToString()}")
+        AppLog.d("TFLiteInit", "Input shape: ${inputShape.joinToString()}")
+        AppLog.d("TFLiteInit", "Output shape: ${outputShape.joinToString()}")
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Preprocessing
+    // ─────────────────────────────────────────────────────────────────────────
 
     /**
      * Converts a Bitmap into the normalized float32 ByteBuffer the model expects.
-     * Confirmed via byte-size mismatch debugging: model expects 4,915,200 bytes
-     * (640*640*3*4), meaning float32 input, normalized 0.0-1.0 — matching how
-     * Ultralytics trains (pixel values / 255.0), regardless of internal INT8 quantization.
+     * Model expects float32 input (4 bytes/channel), normalized 0.0-1.0,
+     * regardless of internal INT8 quantization — confirmed via byte-size mismatch debugging.
      */
     private fun bitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
-        val byteBuffer = ByteBuffer.allocateDirect(1 * modelInputSize * modelInputSize * 3 * 4)
+        val byteBuffer = ByteBuffer.allocateDirect(
+            1 * modelInputSize * modelInputSize * 3 * 4
+        )
         byteBuffer.order(ByteOrder.nativeOrder())
 
         val pixels = IntArray(modelInputSize * modelInputSize)
@@ -85,116 +196,56 @@ class ModelInterpreter(context: Context, modelFileName: String = "best_int8.tfli
         return byteBuffer
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Inference
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
      * Runs inference on a letterboxed 640x640 Bitmap and returns decoded detections.
-     * Returns null if inference throws (caller logs/handles as needed).
+     * Decode/NMS logic delegated to DetectionProcessor (testable independently).
+     * Returns null if inference throws, or if the circuit breaker has tripped
+     * after too many consecutive failures (caller treats both cases the same way).
      */
     fun runInference(bitmap: Bitmap, frameNum: Int): List<Detection>? {
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+            AppLog.e(
+                "Inference",
+                "Skipping frame #$frameNum — too many consecutive failures ($consecutiveFailures)"
+            )
+            return null
+        }
+
         val inputBuffer = bitmapToByteBuffer(bitmap)
         val outputShape = tflite.getOutputTensor(0).shape()
-        val output = Array(outputShape[0]) { Array(outputShape[1]) { FloatArray(outputShape[2]) } }
+        val output = Array(outputShape[0]) {
+            Array(outputShape[1]) { FloatArray(outputShape[2]) }
+        }
 
         return try {
             val startTime = System.nanoTime()
             tflite.run(inputBuffer, output)
             val inferenceTimeMs = (System.nanoTime() - startTime) / 1_000_000
-            Log.d("InferenceTiming", "Frame #$frameNum: ${inferenceTimeMs}ms")
+            AppLog.d("InferenceTiming", "Frame #$frameNum: ${inferenceTimeMs}ms")
 
-            decodeOutput(output)
+            consecutiveFailures = 0
+            DetectionProcessor.decodeOutput(output, classNames)
         } catch (e: Exception) {
-            Log.e("Inference", "Inference failed on frame #$frameNum: ${e.message}")
+            consecutiveFailures++
+            AppLog.e(
+                "Inference",
+                "Inference failed on frame #$frameNum (failure $consecutiveFailures): ${e.message}"
+            )
             null
         }
     }
 
-    /**
-     * Decodes raw model output (1, 10, 8400) into a list of real detections.
-     * Output layout: rows 0-3 = box (x_center, y_center, w, h),
-     * rows 4-9 = confidence scores for each of the 6 classes.
-     * Applies a confidence threshold, then NMS to remove duplicate overlapping boxes.
-     */
-    private fun decodeOutput(
-        output: Array<Array<FloatArray>>,
-        confidenceThreshold: Float = 0.25f,
-        iouThreshold: Float = 0.45f
-    ): List<Detection> {
-        val rawDetections = mutableListOf<Detection>()
-        val numCandidates = output[0][0].size // 8400
-
-        for (i in 0 until numCandidates) {
-            var bestClassId = -1
-            var bestScore = 0f
-            for (classIndex in classNames.indices) {
-                val score = output[0][4 + classIndex][i]
-                if (score > bestScore) {
-                    bestScore = score
-                    bestClassId = classIndex
-                }
-            }
-
-            if (bestScore >= confidenceThreshold && bestClassId != -1) {
-                rawDetections.add(
-                    Detection(
-                        classId = bestClassId,
-                        className = classNames[bestClassId],
-                        confidence = bestScore,
-                        x = output[0][0][i],
-                        y = output[0][1][i],
-                        width = output[0][2][i],
-                        height = output[0][3][i]
-                    )
-                )
-            }
-        }
-
-        return nonMaxSuppression(rawDetections, iouThreshold)
-    }
-
-    /**
-     * Removes overlapping duplicate boxes, keeping only the highest-confidence box
-     * per cluster of overlapping detections (standard NMS algorithm).
-     */
-    private fun nonMaxSuppression(detections: List<Detection>, iouThreshold: Float): List<Detection> {
-        val sorted = detections.sortedByDescending { it.confidence }.toMutableList()
-        val selected = mutableListOf<Detection>()
-
-        while (sorted.isNotEmpty()) {
-            val best = sorted.removeAt(0)
-            selected.add(best)
-            sorted.removeAll { calculateIoU(best, it) > iouThreshold }
-        }
-
-        return selected
-    }
-
-    /**
-     * Intersection-over-Union between two boxes — measures how much they overlap.
-     */
-    private fun calculateIoU(a: Detection, b: Detection): Float {
-        val aLeft = a.x - a.width / 2
-        val aRight = a.x + a.width / 2
-        val aTop = a.y - a.height / 2
-        val aBottom = a.y + a.height / 2
-
-        val bLeft = b.x - b.width / 2
-        val bRight = b.x + b.width / 2
-        val bTop = b.y - b.height / 2
-        val bBottom = b.y + b.height / 2
-
-        val intersectLeft = maxOf(aLeft, bLeft)
-        val intersectTop = maxOf(aTop, bTop)
-        val intersectRight = minOf(aRight, bRight)
-        val intersectBottom = minOf(aBottom, bBottom)
-
-        val intersectArea = maxOf(0f, intersectRight - intersectLeft) * maxOf(0f, intersectBottom - intersectTop)
-        val aArea = a.width * a.height
-        val bArea = b.width * b.height
-        val unionArea = aArea + bArea - intersectArea
-
-        return if (unionArea <= 0f) 0f else intersectArea / unionArea
-    }
+    // ─────────────────────────────────────────────────────────────────────────
+    // Cleanup
+    // ─────────────────────────────────────────────────────────────────────────
 
     fun close() {
         tflite.close()
+        nnApiDelegate?.close()
+        gpuDelegate?.close()
     }
 }

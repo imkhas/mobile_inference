@@ -112,4 +112,4 @@ Full details, debugging history, and notes: see `docs/dev-guide.md`.
 
 ## Why this exists
 
-This was built to answer a practical question: can a phone running a quantized model on-device hold up well enough — in both accuracy and thermal/battery behavior over a real session — to be a viable, low-cost alternative to dedicated edge hardware for field-based defect detection.
+This was built to answer a practical question: can a phone running a quantized model on-device hold up well enough in both accuracy and thermal/battery behavior over a real session and to be a viable, low-cost alternative to dedicated edge hardware for field-based defect detection.
