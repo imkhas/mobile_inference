@@ -22,14 +22,13 @@ object AppConfig {
     val LETTERBOX_PADDING: Float
         get() = (MODEL_INPUT_SIZE - (CAMERA_FRAME_HEIGHT * MODEL_INPUT_SIZE / CAMERA_FRAME_WIDTH)) / 2f
 
-    // --- Class names — must match training order exactly (model.names in Colab) ---
+    // --- Class names — must match training order exactly (data.yml / model.names in Colab) ---
     val CLASS_NAMES = arrayOf(
-        "Alligator Cracking",   // 0: ac
-        "Pothole",               // 1: potholes
-        "Raveling",              // 2: raveling
-        "Stagnant Water",        // 3: sw
-        "Transverse Cracking",   // 4: tc
-        "Longitudinal Cracking"  // 5: lc
+        "cracks",        // 0: cracks
+        "potholes",      // 1: potholes
+        "raveling",      // 2: raveling
+        "sw",            // 3: sw (stagnant water)
+        "manhole_drain"  // 4: manhole_drain
     )
 
     // --- Logging ---
